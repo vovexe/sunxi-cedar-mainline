@@ -40,6 +40,7 @@
 #include <asm/uaccess.h>
 #include <asm/io.h>
 #include <asm/dma.h>
+#include <linux/dma-mapping.h>
 #include <linux/mm.h>
 #include <asm/siginfo.h>
 #include <asm/signal.h>
@@ -58,11 +59,15 @@
 
 #include "cedar_ve.h"
 #include <linux/regulator/consumer.h>
+#include <linux/of_reserved_mem.h>
 
 struct regulator *regu;
 
-#define DRV_VERSION "0.01alpha"
+//#define USE_ION
+//#define CEDAR_DEBUG
+#define HAVE_TIMER_SETUP
 
+#define DRV_VERSION "0.01beta"
 
 #undef USE_CEDAR_ENGINE
 
@@ -80,7 +85,6 @@ struct regulator *regu;
 //#define SUNXI_IRQ_VE		(90)
 #endif
 
-//#define CEDAR_DEBUG
 #define cedar_ve_printk(level, msg...) printk(level "cedar_ve: " msg)
 
 #define VE_CLK_HIGH_WATER  (700)//400MHz
@@ -144,6 +148,10 @@ struct cedar_dev {
   struct reset_control *rstc;
   struct regmap *syscon;
 #endif /*LINUX_VERSION_CODE < KERNEL_VERSION(4,11,0)*/
+  	unsigned long ve_start;
+	unsigned long ve_size;
+	void *ve_start_virt;
+	resource_size_t ve_start_pa;
 };
 
 struct ve_info {
@@ -204,13 +212,15 @@ static irqreturn_t VideoEngineInterupt(int irq, void *dev)
 {
 	ulong ve_int_status_reg;
 	ulong ve_int_ctrl_reg;
-	u32 status;
+	u32 status = 0;
 	volatile int val;
-	int modual_sel;
-	u32 interrupt_enable;
+	int modual_sel = 0;
+	u32 interrupt_enable = 0;
 	struct iomap_para addrs = cedar_devp->iomap_addrs;
 
 	modual_sel = readl(addrs.regs_macc + 0);
+
+	/* case for VE 1633 and newer */
 	if (modual_sel&(3<<6)) {
 		if (modual_sel&(1<<7)) {
 			/*avc enc*/
@@ -246,6 +256,7 @@ static irqreturn_t VideoEngineInterupt(int irq, void *dev)
 			cedar_devp->en_irq_value = 1;
 			cedar_devp->en_irq_flag = 1;
 			/*any interrupt will wake up wait queue*/
+			//printk("Video interrupt occurs EN!!!\n");
 			wake_up_interruptible(&wait_ve);
 		}
 	}
@@ -272,8 +283,9 @@ static irqreturn_t VideoEngineInterupt(int irq, void *dev)
 	}
 #endif
 
+	/* case for all VE versions */
 	modual_sel &= 0xf;
-	if (modual_sel <= 4) {
+	if((modual_sel<=4) || (modual_sel == 0xB)) {
 		/*estimate Which video format*/
 		switch (modual_sel)
 		{
@@ -308,6 +320,12 @@ static irqreturn_t VideoEngineInterupt(int irq, void *dev)
 				ve_int_ctrl_reg = (ulong)(addrs.regs_macc + 0x500 + 0x30);
 				interrupt_enable = readl((void*)ve_int_ctrl_reg) & (0xf);
 				break;
+
+			case 0xB: /*AVC (h264 encoder)*/
+				ve_int_status_reg = (unsigned int)(addrs.regs_macc + 0xb00 + 0x1c);
+    			ve_int_ctrl_reg = (unsigned int)(addrs.regs_macc + 0xb00 + 0x14);
+				interrupt_enable = readl(ve_int_ctrl_reg) &(0x7);
+				break;	
 
 			default:   
 				ve_int_status_reg = (ulong)(addrs.regs_macc + 0x100 + 0x1c);
@@ -502,7 +520,11 @@ int cedardev_check_delay(int check_prio)
 	return timeout_total;
 }
 
+#ifdef HAVE_TIMER_SETUP
+static void cedar_engine_for_timer_rel(struct timer_list *t)
+#else
 static void cedar_engine_for_timer_rel(unsigned long arg)
+#endif
 {
 	ulong flags;
 	int ret = 0;
@@ -522,10 +544,18 @@ static void cedar_engine_for_timer_rel(unsigned long arg)
 	spin_unlock_irqrestore(&cedar_spin_lock, flags);
 }
 
+#ifdef HAVE_TIMER_SETUP
+static void cedar_engine_for_events(struct timer_list *t)
+#else
 static void cedar_engine_for_events(unsigned long arg)
+#endif
 {
 	struct cedarv_engine_task *task_entry, *task_entry_tmp;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,19,0)	
+	struct kernel_siginfo info;
+#else 
 	struct siginfo info;
+#endif	
 	ulong flags;
 
 	spin_lock_irqsave(&cedar_spin_lock, flags);		
@@ -788,19 +818,6 @@ static long compat_cedardev_ioctl(struct file *filp, u32 cmd, unsigned long arg)
 				struct clk *const ve_parent_pll_clk=cedar_devp->ahb_clk;
 				u32 ve_parent_clk_rate;
 #endif /*LINUX_VERSION_CODE >= KERNEL_VERSION(4,11,0)*/
-#if 0
-				int v_div = 0;
-				v_div = (ve_parent_clk_rate/1000000 + (arg_rate-1))/arg_rate;
-				if (v_div <= 8 && v_div >= 1) {
-					if (clk_set_rate(ve_moduleclk, ve_parent_clk_rate/v_div)) {
-						/*
-						 * while set the rate fail, don't return the fail value,
-						 * we can still set the other rate of ve module clk.
-						 */
-						printk("try to set ve_rate fail\n");
-					}
-				}
-#else
 				if (arg_rate >= VE_CLK_LOW_WATER &&
 						arg_rate <= VE_CLK_HIGH_WATER &&
 						clk_get_rate(ve_moduleclk)/1000000 != arg_rate) {
@@ -815,7 +832,6 @@ static long compat_cedardev_ioctl(struct file *filp, u32 cmd, unsigned long arg)
 					}
 				}
 				ret = clk_get_rate(ve_moduleclk);
-#endif
 				break;
 			}
 		case IOCTL_GETVALUE_AVS2:
@@ -831,10 +847,15 @@ static long compat_cedardev_ioctl(struct file *filp, u32 cmd, unsigned long arg)
 		case IOCTL_GET_ENV_INFO:
 			{
 				struct cedarv_env_infomation_compat env_info;
-
+#if defined(USE_ION)
 				env_info.phymem_start = 0; // do not use this interface ,ve get phy mem form ion now
-				env_info.phymem_total_size = 0;//ve_size = 0x04000000
+				env_info.phymem_total_size = 0;//ve_size = 0x04000000 
 				env_info.address_macc = 0;
+#else				
+				env_info.phymem_start = (unsigned int)phys_to_virt(cedar_devp->ve_start); // do not use this interface ,ve get phy mem form ion now
+				env_info.phymem_total_size = cedar_devp->ve_size;
+				env_info.address_macc = (unsigned int) cedar_devp->iomap_addrs.regs_macc;
+#endif	
 				if (copy_to_user((char *)arg, &env_info,
 					sizeof(struct cedarv_env_infomation_compat)))
 					return -EFAULT;
@@ -1126,10 +1147,15 @@ static long cedardev_ioctl(struct file *filp, u32 cmd, unsigned long arg)
 		case IOCTL_GET_ENV_INFO:
 			{
 				struct cedarv_env_infomation env_info;
-
+#if defined(USE_ION)
 				env_info.phymem_start = 0; // do not use this interface ,ve get phy mem form ion now
 				env_info.phymem_total_size = 0;//ve_size = 0x04000000 
 				env_info.address_macc = 0;
+#else				
+				env_info.phymem_start = (unsigned int)phys_to_virt(cedar_devp->ve_start); // do not use this interface ,ve get phy mem form ion now
+				env_info.phymem_total_size = cedar_devp->ve_size;
+				env_info.address_macc = (unsigned int) cedar_devp->iomap_addrs.regs_macc;
+#endif				
 				if (copy_to_user((char *)arg, &env_info, sizeof(struct cedarv_env_infomation)))
 					return -EFAULT;
 			}
@@ -1247,6 +1273,7 @@ static struct vm_operations_struct cedardev_remap_vm_ops = {
 	.close = cedardev_vma_close,
 };
 
+#if defined(USE_ION)
 static int cedardev_mmap(struct file *filp, struct vm_area_struct *vma)
 {
 	u32 temp_pfn;
@@ -1284,6 +1311,54 @@ static int cedardev_mmap(struct file *filp, struct vm_area_struct *vma)
 
 	return 0; 
 }
+#else
+static int cedardev_mmap(struct file *filp, struct vm_area_struct *vma)
+{
+    unsigned long temp_pfn;
+    unsigned int  VAddr;
+	struct iomap_para addrs;
+
+	unsigned int io_ram = 0;
+    VAddr = vma->vm_pgoff << 12;
+	addrs = cedar_devp->iomap_addrs;
+
+    if (VAddr == (unsigned int)addrs.regs_macc) {
+        temp_pfn = MACC_REGS_BASE >> 12;
+        io_ram = 1;
+    } else {
+        temp_pfn = (__pa(vma->vm_pgoff << 12))>>12;
+        io_ram = 0;
+    }
+
+    if (io_ram == 0) {   
+        /* Set reserved and I/O flag for the area. */
+        vma->vm_flags |= /* VM_RESERVED | */VM_IO;
+
+        /* Select uncached access. */
+        //vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
+
+        if (remap_pfn_range(vma, vma->vm_start, temp_pfn,
+                            vma->vm_end - vma->vm_start, vma->vm_page_prot)) {
+            return -EAGAIN;
+        }
+    } else {
+        /* Set reserved and I/O flag for the area. */
+        vma->vm_flags |= /*VM_RESERVED |*/ VM_IO;
+        /* Select uncached access. */
+        vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
+
+        if (io_remap_pfn_range(vma, vma->vm_start, temp_pfn,
+                               vma->vm_end - vma->vm_start, vma->vm_page_prot)) {
+            return -EAGAIN;
+        }
+    }
+    
+    vma->vm_ops = &cedardev_remap_vm_ops;
+    cedardev_vma_open(vma);
+    
+    return 0; 
+}
+#endif
 
 #ifdef CONFIG_PM
 static int snd_sw_cedar_suspend(struct platform_device *pdev,pm_message_t state)
@@ -1364,7 +1439,7 @@ static int cedardev_init(struct platform_device *pdev)
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4,11,0)
 	np = of_find_matching_node(NULL, sunxi_cedar_ve_match);
 	if (!np) {
-	  printk(KERN_ERR "Couldn't find the mali node\n");
+	  printk(KERN_ERR "Couldn't find the VE node\n");
 	  return -ENODEV;
 	}
 #endif /*LINUX_VERSION_CODE >= KERNEL_VERSION(4,11,0)*/
@@ -1403,6 +1478,15 @@ static int cedardev_init(struct platform_device *pdev)
 		cedar_ve_printk(KERN_WARNING, "Can't parse IRQ");
 #else
 	cedar_devp->irq = SUNXI_IRQ_VE;
+#endif
+
+#if defined(CONFIG_OF) && !defined(USE_ION)
+	// assign reserved memory for the VE
+	ret = of_reserved_mem_device_init(cedar_devp->dev);
+    if (ret) {
+        dev_err(cedar_devp->dev, "could not assign reserved memory\n");
+        return -ENODEV;
+    }
 #endif
 
 	sema_init(&cedar_devp->sem, 1);
@@ -1541,9 +1625,10 @@ static int cedardev_init(struct platform_device *pdev)
 	  dev_err(cedar_devp->dev, "syscon failed...\n");
 	  cedar_devp->syscon = NULL;
 	} else {
-	  regmap_write_bits(cedar_devp->syscon, SYSCON_SRAM_CTRL_REG0,
-			    SYSCON_SRAM_C1_MAP_VE,
-			    SYSCON_SRAM_C1_MAP_VE);
+		// remap SRAM C1 to the VE
+	  	regmap_write_bits(cedar_devp->syscon, SYSCON_SRAM_CTRL_REG0,
+					      SYSCON_SRAM_C1_MAP_VE,
+					      SYSCON_SRAM_C1_MAP_VE);
 	}
 
 	cedar_devp->ahb_clk = devm_clk_get(cedar_devp->dev, "ahb");
@@ -1597,6 +1682,12 @@ static int cedardev_init(struct platform_device *pdev)
 	  return -EFAULT;
 	}
 	cedar_devp->rstc = devm_reset_control_get(cedar_devp->dev, NULL);
+	if (IS_ERR(cedar_devp->rstc)) {
+		dev_err(cedar_devp->dev, "Failed to get reset control\n");
+		ret = PTR_ERR(cedar_devp->rstc);
+		return -EFAULT;
+	}
+
 	reset_control_assert(cedar_devp->rstc);
 #else /*LINUX_VERSION_CODE >= KERNEL_VERSION(4,11,0)*/
 	sunxi_periph_reset_assert(ve_moduleclk);
@@ -1614,13 +1705,32 @@ static int cedardev_init(struct platform_device *pdev)
 	}
 	cedar_devp->class = class_create(THIS_MODULE, "cedar_dev");
 	cedar_devp->odev  = device_create(cedar_devp->class, NULL, devno, NULL, "cedar_dev");
-
+#ifdef HAVE_TIMER_SETUP
+	timer_setup(&cedar_devp->cedar_engine_timer, &cedar_engine_for_events, 0);
+	timer_setup(&cedar_devp->cedar_engine_timer_rel, &cedar_engine_for_timer_rel, 0);
+#else
 	setup_timer(&cedar_devp->cedar_engine_timer, cedar_engine_for_events, (ulong)cedar_devp);
 	setup_timer(&cedar_devp->cedar_engine_timer_rel, cedar_engine_for_timer_rel, (ulong)cedar_devp);
-
+#endif
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4,11,0)
 	of_node_put(np);
 #endif /*LINUX_VERSION_CODE >= KERNEL_VERSION(4,11,0)*/
+
+#if !defined(USE_ION)
+	cedar_devp->ve_size = 80 * SZ_1M;
+	dma_set_coherent_mask(cedar_devp->dev, 0xFFFFFFFF);
+	cedar_devp->ve_start_virt = dma_alloc_coherent(cedar_devp->dev, cedar_devp->ve_size,
+												   &cedar_devp->ve_start_pa,
+												   GFP_KERNEL | GFP_DMA);
+
+	if (!cedar_devp->ve_start_virt) {
+		dev_err(cedar_devp->dev, "cedar: failed to allocate memory buffer\n");
+		return -ENODEV;
+	}
+	cedar_devp->ve_start = cedar_devp->ve_start_pa;
+
+	printk("[cedar]: memory allocated at address %08X\n", cedar_devp->ve_start);
+#endif
 
 	printk("[cedar]: install end!!!\n");
 	return 0;
@@ -1638,6 +1748,15 @@ static void cedardev_exit(void)
 
 	if (cedar_devp->sram_bass_vir) iounmap(cedar_devp->sram_bass_vir);
         if (cedar_devp->clk_bass_vir)  iounmap(cedar_devp->clk_bass_vir);
+
+#if !defined(USE_ION)
+    if (cedar_devp->ve_start_virt)
+    	dma_free_coherent(NULL, cedar_devp->ve_size, cedar_devp->ve_start_virt, cedar_devp->ve_start);      	 
+
+# if defined(CONFIG_OF)
+	of_reserved_mem_device_release(cedar_devp->dev);
+# endif	
+#endif	
 
 	/* Destroy char device */
 	if (cedar_devp) {
