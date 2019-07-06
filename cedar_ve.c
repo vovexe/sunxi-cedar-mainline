@@ -324,7 +324,7 @@ static irqreturn_t VideoEngineInterupt(int irq, void *dev)
 			case 0xB: /*AVC (h264 encoder)*/
 				ve_int_status_reg = (unsigned int)(addrs.regs_macc + 0xb00 + 0x1c);
     			ve_int_ctrl_reg = (unsigned int)(addrs.regs_macc + 0xb00 + 0x14);
-				interrupt_enable = readl(ve_int_ctrl_reg) &(0x7);
+				interrupt_enable = readl((void*)ve_int_ctrl_reg) &(0x7);
 				break;	
 
 			default:   
@@ -551,7 +551,7 @@ static void cedar_engine_for_events(unsigned long arg)
 #endif
 {
 	struct cedarv_engine_task *task_entry, *task_entry_tmp;
-#if LINUX_VERSION_CODE == KERNEL_VERSION(4,19,0)	
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,19,0)	
 	struct kernel_siginfo info;
 #else 
 	struct siginfo info;
@@ -1729,7 +1729,7 @@ static int cedardev_init(struct platform_device *pdev)
 	}
 	cedar_devp->ve_start = cedar_devp->ve_start_pa;
 
-	printk("[cedar]: memory allocated at address %08X\n", cedar_devp->ve_start);
+	printk("[cedar]: memory allocated at address %08lX\n", cedar_devp->ve_start);
 #endif
 
 	printk("[cedar]: install end!!!\n");
