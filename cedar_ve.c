@@ -551,7 +551,7 @@ static void cedar_engine_for_events(unsigned long arg)
 #endif
 {
 	struct cedarv_engine_task *task_entry, *task_entry_tmp;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,19,0)	
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,20,0)	
 	struct kernel_siginfo info;
 #else 
 	struct siginfo info;
